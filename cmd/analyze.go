@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -36,7 +37,7 @@ func analyzeProject(projectName string) {
 	}
 
 	projectDir := filepath.Join(homeDir, ".claude", "projects", projectName)
-	
+
 	if _, err := os.Stat(projectDir); os.IsNotExist(err) {
 		fmt.Printf("Project '%s' not found\n", projectName)
 		return
@@ -69,7 +70,7 @@ func analyzeProject(projectName string) {
 	// Start Bubble Tea program
 	model := newModel(entries, projectName, projectDir, files, 0)
 	p := tea.NewProgram(model, tea.WithAltScreen())
-	
+
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running TUI: %v\n", err)
 		os.Exit(1)
@@ -77,28 +78,28 @@ func analyzeProject(projectName string) {
 }
 
 type ConversationEntry struct {
-	ParentUuid   *string `json:"parentUuid,omitempty"`
-	IsSidechain  *bool   `json:"isSidechain,omitempty"`
-	UserType     *string `json:"userType,omitempty"`
-	Cwd          *string `json:"cwd,omitempty"`
-	SessionId    *string `json:"sessionId,omitempty"`
-	Version      *string `json:"version,omitempty"`
-	Message      Message `json:"message"`
-	RequestId    *string `json:"requestId,omitempty"`
-	Type         string  `json:"type"`
-	Uuid         string  `json:"uuid"`
-	Timestamp    string  `json:"timestamp"`
+	ParentUuid  *string `json:"parentUuid,omitempty"`
+	IsSidechain *bool   `json:"isSidechain,omitempty"`
+	UserType    *string `json:"userType,omitempty"`
+	Cwd         *string `json:"cwd,omitempty"`
+	SessionId   *string `json:"sessionId,omitempty"`
+	Version     *string `json:"version,omitempty"`
+	Message     Message `json:"message"`
+	RequestId   *string `json:"requestId,omitempty"`
+	Type        string  `json:"type"`
+	Uuid        string  `json:"uuid"`
+	Timestamp   string  `json:"timestamp"`
 }
 
 type Message struct {
-	Id           *string   `json:"id,omitempty"`
-	Type         *string   `json:"type,omitempty"`
-	Role         string    `json:"role"`
-	Model        *string   `json:"model,omitempty"`
+	Id           *string         `json:"id,omitempty"`
+	Type         *string         `json:"type,omitempty"`
+	Role         string          `json:"role"`
+	Model        *string         `json:"model,omitempty"`
 	Content      json.RawMessage `json:"content"`
-	StopReason   *string   `json:"stop_reason,omitempty"`
-	StopSequence *string   `json:"stop_sequence,omitempty"`
-	Usage        *Usage    `json:"usage,omitempty"`
+	StopReason   *string         `json:"stop_reason,omitempty"`
+	StopSequence *string         `json:"stop_sequence,omitempty"`
+	Usage        *Usage          `json:"usage,omitempty"`
 }
 
 type Content struct {
@@ -110,11 +111,11 @@ type Content struct {
 }
 
 type Usage struct {
-	InputTokens               int    `json:"input_tokens"`
-	CacheCreationInputTokens  int    `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens      int    `json:"cache_read_input_tokens"`
-	OutputTokens              int    `json:"output_tokens"`
-	ServiceTier               string `json:"service_tier"`
+	InputTokens              int    `json:"input_tokens"`
+	CacheCreationInputTokens int    `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int    `json:"cache_read_input_tokens"`
+	OutputTokens             int    `json:"output_tokens"`
+	ServiceTier              string `json:"service_tier"`
 }
 
 // Bubble Tea Model
@@ -128,6 +129,7 @@ type model struct {
 	projectDir     string
 	files          []string
 	currentFileIdx int
+	errorMessage   string
 }
 
 func newModel(entries []ConversationEntry, projectName, projectDir string, files []string, currentFileIdx int) model {
@@ -135,8 +137,8 @@ func newModel(entries []ConversationEntry, projectName, projectDir string, files
 		entries:        entries,
 		projectName:    projectName,
 		cursor:         0,
-		viewportWidth:  80,  // Default width
-		viewportHeight: 24,  // Default height
+		viewportWidth:  80, // Default width
+		viewportHeight: 24, // Default height
 		scrollOffset:   0,
 		projectDir:     projectDir,
 		files:          files,
@@ -154,43 +156,73 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewportHeight = msg.Height
 		m.viewportWidth = msg.Width
 		return m, nil
-		
+
 	case tea.KeyMsg:
+		// Clear error message on any key press
+		m.errorMessage = ""
+
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
-			
+
 		case "up", "k":
-			if m.cursor > 0 {
+			if m.cursor > 0 && len(m.entries) > 0 {
 				m.cursor--
 				// Adjust scroll if cursor goes above visible area
 				if m.cursor < m.scrollOffset {
 					m.scrollOffset = m.cursor
 				}
 			}
-			
+
 		case "down", "j":
-			if m.cursor < len(m.entries)-1 {
+			if m.cursor < len(m.entries)-1 && len(m.entries) > 0 {
 				m.cursor++
 				// Adjust scroll if cursor goes below visible area
 				visibleHeight := m.getListHeight()
-				if m.cursor >= m.scrollOffset + visibleHeight {
+				if m.cursor >= m.scrollOffset+visibleHeight {
 					m.scrollOffset = m.cursor - visibleHeight + 1
 				}
 			}
-			
+
 		case "n":
 			// Next file
 			if m.currentFileIdx < len(m.files)-1 {
 				return m.loadFile(m.currentFileIdx + 1), nil
 			}
-			
+
 		case "p":
 			// Previous file
 			if m.currentFileIdx > 0 {
 				return m.loadFile(m.currentFileIdx - 1), nil
 			}
-			
+
+		case "left":
+			// Previous user prompt
+			if len(m.entries) > 0 {
+				newPosition := m.findPreviousUserPrompt()
+				if newPosition != m.cursor && newPosition >= 0 && newPosition < len(m.entries) {
+					m.cursor = newPosition
+					// Adjust scroll if cursor goes above visible area
+					if m.cursor < m.scrollOffset {
+						m.scrollOffset = m.cursor
+					}
+				}
+			}
+
+		case "right":
+			// Next user prompt
+			if len(m.entries) > 0 {
+				newPosition := m.findNextUserPrompt()
+				if newPosition != m.cursor && newPosition >= 0 && newPosition < len(m.entries) {
+					m.cursor = newPosition
+					// Adjust scroll if cursor goes below visible area
+					visibleHeight := m.getListHeight()
+					if m.cursor >= m.scrollOffset+visibleHeight {
+						m.scrollOffset = m.cursor - visibleHeight + 1
+					}
+				}
+			}
+
 		case "e":
 			// Export user prompts
 			err := m.exportUserPrompts()
@@ -200,7 +232,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	
+
 	return m, nil
 }
 
@@ -216,25 +248,28 @@ func (m model) getListHeight() int {
 
 func (m model) loadFile(fileIdx int) model {
 	if fileIdx < 0 || fileIdx >= len(m.files) {
-		return m // Invalid index, return unchanged
+		m.errorMessage = "Invalid file index"
+		return m
 	}
-	
+
 	entries, err := loadDataFromFile(m.files[fileIdx])
 	if err != nil {
-		return m // Error loading, return unchanged
+		m.errorMessage = fmt.Sprintf("Error loading file: %v", err)
+		return m
 	}
-	
+
 	// Create new model with the loaded data and reset positions
 	return model{
 		entries:        entries,
 		projectName:    m.projectName,
-		cursor:         0,          // Reset to first entry
+		cursor:         0, // Reset to first entry
 		viewportHeight: m.viewportHeight,
 		viewportWidth:  m.viewportWidth,
-		scrollOffset:   0,          // Reset scroll to top
+		scrollOffset:   0, // Reset scroll to top
 		projectDir:     m.projectDir,
 		files:          m.files,
 		currentFileIdx: fileIdx,
+		errorMessage:   "", // Clear error on successful load
 	}
 }
 
@@ -243,11 +278,11 @@ func (m model) View() string {
 	if m.viewportWidth == 0 {
 		return "Loading..."
 	}
-	
+
 	// Calculate pane widths
 	leftWidth := int(float64(m.viewportWidth) * 0.3)
 	rightWidth := m.viewportWidth - leftWidth - 1 // -1 for border
-	
+
 	// Header
 	headerStyle := lipgloss.NewStyle().
 		Bold(true).
@@ -255,41 +290,54 @@ func (m model) View() string {
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderBottom(true).
 		Width(m.viewportWidth)
-		
+
 	currentFile := "unknown"
 	if m.currentFileIdx < len(m.files) {
 		currentFile = filepath.Base(m.files[m.currentFileIdx])
 	}
-	
-	header := headerStyle.Render(fmt.Sprintf("Claude Project: %s | File: %s (%d/%d) | Entries: %d", 
+
+	header := headerStyle.Render(fmt.Sprintf("Claude Project: %s | File: %s (%d/%d) | Entries: %d",
 		m.projectName, currentFile, m.currentFileIdx+1, len(m.files), len(m.entries)))
-	
+
 	// Left pane - Entry list
 	leftPane := m.renderLeftPane(leftWidth)
-	
+
 	// Right pane - Details
 	rightPane := m.renderRightPane(rightWidth)
-	
+
 	// Combine panes
 	content := lipgloss.JoinHorizontal(
 		lipgloss.Top,
 		leftPane,
 		rightPane,
 	)
-	
+
 	// Status line at bottom
-	statusStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("240")).
-		Background(lipgloss.Color("235")).
-		Width(m.viewportWidth).
-		PaddingLeft(1).
-		PaddingRight(1)
-	
-	statusText := fmt.Sprintf("Keys: ↑/↓,j/k: navigate | n/p: next/prev file | e: export prompts | q: quit | [U]=User [A]=Assistant [T]=Tools | Entry: %d/%d", 
-		m.cursor+1, len(m.entries))
-	
-	status := statusStyle.Render(statusText)
-	
+	var status string
+	if m.errorMessage != "" {
+		// Show error message in red
+		errorStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Background(lipgloss.Color("235")).
+			Width(m.viewportWidth).
+			PaddingLeft(1).
+			PaddingRight(1)
+		status = errorStyle.Render(m.errorMessage + " (press any key to continue)")
+	} else {
+		// Show normal status
+		statusStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Background(lipgloss.Color("235")).
+			Width(m.viewportWidth).
+			PaddingLeft(1).
+			PaddingRight(1)
+
+		statusText := fmt.Sprintf("Keys: ↑/↓,j/k: navigate | ←/→: prev/next user prompt | n/p: next/prev file | e: export prompts | q: quit | [U]=User [A]=Assistant [T]=Tools | Entry: %d/%d",
+			m.cursor+1, len(m.entries))
+
+		status = statusStyle.Render(statusText)
+	}
+
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
@@ -301,39 +349,39 @@ func (m model) View() string {
 
 func (m model) renderLeftPane(width int) string {
 	height := m.getListHeight()
-	
+
 	leftStyle := lipgloss.NewStyle().
 		Width(width).
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderRight(true).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1)
-	
+
 	if len(m.entries) == 0 {
 		return leftStyle.Render("No entries")
 	}
-	
+
 	var listItems []string
-	
+
 	// Calculate visible range
 	start := m.scrollOffset
 	end := start + height
 	if end > len(m.entries) {
 		end = len(m.entries)
 	}
-	
+
 	// Calculate available width for content (account for padding and borders)
 	contentWidth := width - 4 // 2 for padding + 2 for borders
-	
+
 	// Render only visible items
 	for i := start; i < end; i++ {
 		entry := m.entries[i]
 		shortSummary := m.getShortSummary(entry)
-		
+
 		// Visual indicators with consistent width
 		var indicator string
 		var style lipgloss.Style
-		
+
 		if entry.Message.Role == "user" {
 			indicator = "[U]"
 			style = lipgloss.NewStyle().Foreground(lipgloss.Color("39")) // Blue
@@ -348,20 +396,20 @@ func (m model) renderLeftPane(width int) string {
 				style = lipgloss.NewStyle().Foreground(lipgloss.Color("46")) // Green
 			}
 		}
-		
+
 		// Highlight current selection with strong visual indication
 		if i == m.cursor {
 			style = style.Bold(true).
 				Background(lipgloss.Color("62")).
 				Foreground(lipgloss.Color("230"))
 		}
-		
+
 		// Create consistent-width item with proper text width calculation
 		item := fmt.Sprintf("%s %s", indicator, shortSummary)
-		
+
 		// Calculate actual display width (accounting for multi-byte characters)
 		displayWidth := utf8.RuneCountInString(item)
-		
+
 		// Ensure consistent width by padding or truncating
 		if displayWidth > contentWidth {
 			// Truncate while preserving UTF-8 boundaries
@@ -380,16 +428,16 @@ func (m model) renderLeftPane(width int) string {
 			padding := contentWidth - displayWidth
 			item = item + strings.Repeat(" ", padding)
 		}
-		
+
 		listItems = append(listItems, style.Width(contentWidth).Render(item))
 	}
-	
+
 	// Fill remaining space if needed
 	emptyStyle := lipgloss.NewStyle().Width(contentWidth)
 	for len(listItems) < height {
 		listItems = append(listItems, emptyStyle.Render(""))
 	}
-	
+
 	content := strings.Join(listItems, "\n")
 	return leftStyle.Render(content)
 }
@@ -398,43 +446,43 @@ func (m model) renderRightPane(width int) string {
 	rightStyle := lipgloss.NewStyle().
 		Width(width).
 		Padding(1, 2)
-	
+
 	if len(m.entries) == 0 {
 		return rightStyle.Render("No entries found")
 	}
-	
+
 	if m.cursor >= len(m.entries) || m.cursor < 0 {
-		return rightStyle.Render(fmt.Sprintf("Invalid selection: cursor=%d, entries=%d", m.cursor, len(m.entries)))
+		return rightStyle.Render("")
 	}
-	
+
 	entry := m.entries[m.cursor]
 	details := m.renderEntryDetails(entry)
-	
+
 	if details == "" {
 		return rightStyle.Render("No details available for this entry")
 	}
-	
+
 	return rightStyle.Render(details)
 }
 
 func (m model) exportUserPrompts() error {
 	// Create filename based on project name
 	filename := fmt.Sprintf("%s.md", m.projectName)
-	
+
 	// Collect all relevant messages from all files
 	var allMessages []MessageEntry
-	
+
 	// Process all files in the project
 	for _, filePath := range m.files {
 		entries, err := loadDataFromFile(filePath)
 		if err != nil {
 			continue // Skip files that can't be loaded
 		}
-		
+
 		for _, entry := range entries {
 			var textContent string
 			var isQuestion bool
-			
+
 			if entry.Message.Role == "user" {
 				// User messages - extract text content
 				if err := json.Unmarshal(entry.Message.Content, &textContent); err == nil {
@@ -474,17 +522,17 @@ func (m model) exportUserPrompts() error {
 						if content.Type == "text" && strings.TrimSpace(content.Text) != "" {
 							text := strings.TrimSpace(content.Text)
 							// Check if it's likely a question
-							if strings.Contains(text, "?") || 
-							   strings.Contains(strings.ToLower(text), "could you") ||
-							   strings.Contains(strings.ToLower(text), "can you") ||
-							   strings.Contains(strings.ToLower(text), "would you") ||
-							   strings.Contains(strings.ToLower(text), "please") ||
-							   strings.Contains(strings.ToLower(text), "which") ||
-							   strings.Contains(strings.ToLower(text), "what") ||
-							   strings.Contains(strings.ToLower(text), "how") ||
-							   strings.Contains(strings.ToLower(text), "when") ||
-							   strings.Contains(strings.ToLower(text), "where") ||
-							   strings.Contains(strings.ToLower(text), "why") {
+							if strings.Contains(text, "?") ||
+								strings.Contains(strings.ToLower(text), "could you") ||
+								strings.Contains(strings.ToLower(text), "can you") ||
+								strings.Contains(strings.ToLower(text), "would you") ||
+								strings.Contains(strings.ToLower(text), "please") ||
+								strings.Contains(strings.ToLower(text), "which") ||
+								strings.Contains(strings.ToLower(text), "what") ||
+								strings.Contains(strings.ToLower(text), "how") ||
+								strings.Contains(strings.ToLower(text), "when") ||
+								strings.Contains(strings.ToLower(text), "where") ||
+								strings.Contains(strings.ToLower(text), "why") {
 								textParts = append(textParts, text)
 								isQuestion = true
 							}
@@ -501,39 +549,39 @@ func (m model) exportUserPrompts() error {
 			}
 		}
 	}
-	
+
 	if len(allMessages) == 0 {
 		return fmt.Errorf("no user prompts or assistant questions found to export")
 	}
-	
+
 	// Generate nicely formatted markdown content
 	var md strings.Builder
-	
+
 	// Add header
 	md.WriteString(fmt.Sprintf("# 💬 Conversation Prompts & Questions\n"))
 	md.WriteString(fmt.Sprintf("**Project:** %s\n\n", m.projectName))
 	md.WriteString("---\n\n")
-	
+
 	for i, message := range allMessages {
 		content := strings.TrimSpace(message.Content)
-		
+
 		if message.IsUser {
 			md.WriteString("## 👤 User Prompt\n\n")
 		} else {
 			md.WriteString("## 🤖 Assistant\n\n")
 		}
-		
+
 		md.WriteString(content)
 		md.WriteString("\n\n")
-		
+
 		// Add separator between messages (except for the last one)
 		if i < len(allMessages)-1 {
 			md.WriteString("---\n\n")
 		}
 	}
-	
+
 	// Write to file
-	return os.WriteFile(filename, []byte(md.String()), 0644)
+	return os.WriteFile(filename, []byte(md.String()), 0o644)
 }
 
 type MessageEntry struct {
@@ -545,13 +593,13 @@ type MessageEntry struct {
 func (m model) getShortSummary(entry ConversationEntry) string {
 	// Calculate available space for summary (total width - indicator - spaces)
 	leftWidth := int(float64(m.viewportWidth) * 0.3)
-	contentWidth := leftWidth - 4 // Account for padding and borders
+	contentWidth := leftWidth - 4           // Account for padding and borders
 	availableForSummary := contentWidth - 4 // Account for "[X] " indicator
-	
+
 	if availableForSummary < 5 {
 		availableForSummary = 10 // Minimum reasonable space
 	}
-	
+
 	// Extract content text
 	var text string
 	var contentStr string
@@ -570,43 +618,43 @@ func (m model) getShortSummary(entry ConversationEntry) string {
 			text = strings.Join(textParts, " ")
 		}
 	}
-	
+
 	if text == "" {
 		return "No content"
 	}
-	
+
 	// Clean up the text (remove extra whitespace)
 	text = strings.TrimSpace(text)
 	text = strings.ReplaceAll(text, "\n", " ")
 	text = strings.ReplaceAll(text, "\t", " ")
-	
+
 	// Remove multiple spaces
 	for strings.Contains(text, "  ") {
 		text = strings.ReplaceAll(text, "  ", " ")
 	}
-	
+
 	// Truncate to fit available space, breaking at word boundaries when possible
 	if utf8.RuneCountInString(text) <= availableForSummary {
 		return text
 	}
-	
+
 	// Find the best place to cut
 	words := strings.Fields(text)
 	result := ""
-	
+
 	for _, word := range words {
 		testResult := result
 		if testResult != "" {
 			testResult += " "
 		}
 		testResult += word
-		
+
 		if utf8.RuneCountInString(testResult) > availableForSummary-3 { // Reserve space for "..."
 			break
 		}
 		result = testResult
 	}
-	
+
 	if result == "" {
 		// If even the first word is too long, truncate it
 		runes := []rune(text)
@@ -616,7 +664,7 @@ func (m model) getShortSummary(entry ConversationEntry) string {
 			result = text
 		}
 	}
-	
+
 	return result
 }
 
@@ -632,9 +680,55 @@ func (m model) hasTools(entry ConversationEntry) bool {
 	return false
 }
 
+func (m model) isNonEmptyUserPrompt(entry ConversationEntry) bool {
+	if entry.Message.Role != "user" {
+		return false
+	}
+
+	// Extract content text
+	var text string
+	var contentStr string
+	if err := json.Unmarshal(entry.Message.Content, &contentStr); err == nil {
+		text = contentStr
+	} else {
+		// Handle array content
+		var contentArray []Content
+		if err := json.Unmarshal(entry.Message.Content, &contentArray); err == nil {
+			var textParts []string
+			for _, content := range contentArray {
+				if content.Type == "text" && content.Text != "" {
+					textParts = append(textParts, content.Text)
+				}
+			}
+			text = strings.Join(textParts, " ")
+		}
+	}
+
+	// Check if text content is meaningful (not just whitespace)
+	return strings.TrimSpace(text) != ""
+}
+
+func (m model) findNextUserPrompt() int {
+	for i := m.cursor + 1; i < len(m.entries); i++ {
+		if m.isNonEmptyUserPrompt(m.entries[i]) {
+			return i
+		}
+	}
+	return m.cursor // No next non-empty user prompt found, stay at current position
+}
+
+func (m model) findPreviousUserPrompt() int {
+	for i := m.cursor - 1; i >= 0; i-- {
+		if m.isNonEmptyUserPrompt(m.entries[i]) {
+			return i
+		}
+	}
+	return m.cursor // No previous non-empty user prompt found, stay at current position
+}
+
 func (m model) renderEntryDetails(entry ConversationEntry) string {
 	var lines []string
-	
+
 	// Title
 	if entry.Message.Role == "user" {
 		lines = append(lines, "👤 USER MESSAGE")
@@ -645,15 +739,15 @@ func (m model) renderEntryDetails(entry ConversationEntry) string {
 		}
 		lines = append(lines, fmt.Sprintf("🤖 %s", strings.ToUpper(model)))
 	}
-	
+
 	lines = append(lines, "")
-	
+
 	// Entry Metadata
 	lines = append(lines, "📋 Entry Metadata:")
 	lines = append(lines, fmt.Sprintf("  UUID: %s", entry.Uuid))
 	lines = append(lines, fmt.Sprintf("  Type: %s", entry.Type))
 	lines = append(lines, fmt.Sprintf("  Timestamp: %s", entry.Timestamp))
-	
+
 	if entry.RequestId != nil {
 		lines = append(lines, fmt.Sprintf("  Request ID: %s", *entry.RequestId))
 	}
@@ -675,9 +769,9 @@ func (m model) renderEntryDetails(entry ConversationEntry) string {
 	if entry.SessionId != nil {
 		lines = append(lines, fmt.Sprintf("  Session ID: %s", *entry.SessionId))
 	}
-	
+
 	lines = append(lines, "")
-	
+
 	// Message Metadata
 	lines = append(lines, "📨 Message Metadata:")
 	lines = append(lines, fmt.Sprintf("  Role: %s", entry.Message.Role))
@@ -693,13 +787,13 @@ func (m model) renderEntryDetails(entry ConversationEntry) string {
 	if entry.Message.StopSequence != nil {
 		lines = append(lines, fmt.Sprintf("  Stop Sequence: %s", *entry.Message.StopSequence))
 	}
-	
+
 	lines = append(lines, "")
-	
+
 	// Parse and display content
 	var textContent []string
 	var toolDetails []Content
-	
+
 	var contentStr string
 	if err := json.Unmarshal(entry.Message.Content, &contentStr); err == nil {
 		textContent = append(textContent, contentStr)
@@ -720,7 +814,7 @@ func (m model) renderEntryDetails(entry ConversationEntry) string {
 			}
 		}
 	}
-	
+
 	// Content
 	lines = append(lines, "💬 Content:")
 	if len(textContent) > 0 {
@@ -730,9 +824,9 @@ func (m model) renderEntryDetails(entry ConversationEntry) string {
 	} else {
 		lines = append(lines, "  (No text content)")
 	}
-	
+
 	lines = append(lines, "")
-	
+
 	// Tools
 	if len(toolDetails) > 0 {
 		lines = append(lines, "🛠️  Tools Used:")
@@ -842,28 +936,28 @@ func (m model) renderEntryDetails(entry ConversationEntry) string {
 		}
 		lines = append(lines, "")
 	}
-	
+
 	// Enhanced Usage Information
 	if entry.Message.Usage != nil {
 		lines = append(lines, "📊 Token Usage:")
 		lines = append(lines, fmt.Sprintf("  Input Tokens: %d", entry.Message.Usage.InputTokens))
 		lines = append(lines, fmt.Sprintf("  Output Tokens: %d", entry.Message.Usage.OutputTokens))
-		
+
 		if entry.Message.Usage.CacheCreationInputTokens > 0 {
 			lines = append(lines, fmt.Sprintf("  Cache Creation Tokens: %d", entry.Message.Usage.CacheCreationInputTokens))
 		}
 		if entry.Message.Usage.CacheReadInputTokens > 0 {
 			lines = append(lines, fmt.Sprintf("  Cache Read Tokens: %d", entry.Message.Usage.CacheReadInputTokens))
 		}
-		
+
 		totalTokens := entry.Message.Usage.InputTokens + entry.Message.Usage.OutputTokens
 		lines = append(lines, fmt.Sprintf("  Total Tokens: %d", totalTokens))
-		
+
 		if entry.Message.Usage.ServiceTier != "" {
 			lines = append(lines, fmt.Sprintf("  Service Tier: %s", entry.Message.Usage.ServiceTier))
 		}
 	}
-	
+
 	return strings.Join(lines, "\n")
 }
 
@@ -1050,7 +1144,6 @@ func extractContentSummary(entry ConversationEntry) string {
 	return "No content"
 }
 
-
 func loadProjectData(projectDir string) ([]ConversationEntry, error) {
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
@@ -1077,6 +1170,10 @@ func loadProjectData(projectDir string) ([]ConversationEntry, error) {
 
 	var conversationEntries []ConversationEntry
 	scanner := bufio.NewScanner(file)
+
+	// Increase buffer size to handle large conversation entries (up to 10MB per line)
+	buf := make([]byte, 0, 64*1024)   // Start with 64KB initial buffer
+	scanner.Buffer(buf, 10*1024*1024) // Allow up to 10MB max token size
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1106,11 +1203,33 @@ func findProjectFiles(projectDir string) ([]string, error) {
 		return nil, err
 	}
 
-	var jsonFiles []string
+	type fileInfo struct {
+		path    string
+		modTime int64
+	}
+
+	var files []fileInfo
 	for _, entry := range entries {
 		if !entry.IsDir() && (strings.HasSuffix(entry.Name(), ".json") || strings.HasSuffix(entry.Name(), ".jsonl")) {
-			jsonFiles = append(jsonFiles, filepath.Join(projectDir, entry.Name()))
+			filePath := filepath.Join(projectDir, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			files = append(files, fileInfo{
+				path:    filePath,
+				modTime: info.ModTime().Unix(),
+			})
 		}
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].modTime < files[j].modTime
+	})
+
+	var jsonFiles []string
+	for _, file := range files {
+		jsonFiles = append(jsonFiles, file.path)
 	}
 
 	return jsonFiles, nil
@@ -1125,6 +1244,10 @@ func loadDataFromFile(filePath string) ([]ConversationEntry, error) {
 
 	var conversationEntries []ConversationEntry
 	scanner := bufio.NewScanner(file)
+
+	// Increase buffer size to handle large conversation entries (up to 10MB per line)
+	buf := make([]byte, 0, 64*1024)   // Start with 64KB initial buffer
+	scanner.Buffer(buf, 10*1024*1024) // Allow up to 10MB max token size
 
 	for scanner.Scan() {
 		line := scanner.Text()

@@ -29,7 +29,7 @@ func listProjects() {
 	}
 
 	projectsDir := filepath.Join(homeDir, ".claude", "projects")
-	
+
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
 		fmt.Printf("Error reading projects directory: %v\n", err)
